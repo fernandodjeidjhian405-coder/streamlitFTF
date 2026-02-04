@@ -1,4 +1,3 @@
-# file: app_web.py
 import math
 import os
 import sqlite3
@@ -11,7 +10,6 @@ import numpy as np
 import streamlit as st
 import mediapipe as mp
 
-# Try to enable realtime video via WebRTC.
 WEBRTC_AVAILABLE = False
 try:
     import av
@@ -21,21 +19,12 @@ except Exception:
     WEBRTC_AVAILABLE = False
 
 try:
-    from passlib.hash import bcrypt
-    PASSLIB_AVAILABLE = True
-except ImportError:
-    PASSLIB_AVAILABLE = False
-
-try:
     import plotly.express as px
     import plotly.graph_objects as go
     PLOTLY_AVAILABLE = True
 except ImportError:
     PLOTLY_AVAILABLE = False
 
-# -------------------------------------------------------------------
-# Database setup
-# -------------------------------------------------------------------
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 DB_PATH = os.path.join(DATA_DIR, "mood_tracker.db")
 
@@ -45,12 +34,20 @@ def init_db():
     os.makedirs(DATA_DIR, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
+
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='users'")
+    if cur.fetchone():
+        cur.execute("PRAGMA table_info(users)")
+        columns = [row[1] for row in cur.fetchall()]
+        if "password_hash" in columns:
+            cur.execute("DROP TABLE IF EXISTS mood_logs")
+            cur.execute("DROP TABLE users")
+            conn.commit()
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            email TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
+            nickname TEXT NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
@@ -59,10 +56,16 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
             mood TEXT NOT NULL,
+            intensity INTEGER DEFAULT 3 CHECK (intensity >= 1 AND intensity <= 5),
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (user_id) REFERENCES users(id)
         )
     """)
+    # Migration: add intensity column if missing (older DBs)
+    cur.execute("PRAGMA table_info(mood_logs)")
+    cols = [row[1] for row in cur.fetchall()]
+    if "intensity" not in cols:
+        cur.execute("ALTER TABLE mood_logs ADD COLUMN intensity INTEGER DEFAULT 3")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_mood_logs_user ON mood_logs(user_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_mood_logs_created ON mood_logs(created_at)")
     conn.commit()
@@ -73,45 +76,35 @@ def get_conn():
     return sqlite3.connect(DB_PATH)
 
 
-def create_user(username: str, email: str, password: str) -> Optional[int]:
-    """Create a new user. Returns user_id on success, None on failure."""
-    if not PASSLIB_AVAILABLE:
+def get_or_create_user_by_nickname(nickname: str) -> Optional[int]:
+    """Find existing user by nickname or create new one. Returns user_id."""
+    nick = nickname.strip()
+    if not nick:
         return None
-    try:
-        conn = get_conn()
-        cur = conn.cursor()
-        pw_hash = bcrypt.hash(password)
-        cur.execute(
-            "INSERT INTO users (username, email, password_hash) VALUES (?, ?, ?)",
-            (username.strip(), email.strip().lower(), pw_hash),
-        )
-        user_id = cur.lastrowid
-        conn.commit()
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM users WHERE nickname = ?", (nick,))
+    row = cur.fetchone()
+    if row:
+        user_id = row[0]
         conn.close()
         return user_id
-    except sqlite3.IntegrityError:
-        return None
-
-
-def verify_user(username: str, password: str) -> Optional[int]:
-    """Verify credentials. Returns user_id on success, None on failure."""
-    if not PASSLIB_AVAILABLE:
-        return None
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT id, password_hash FROM users WHERE username = ?", (username.strip(),))
-    row = cur.fetchone()
+    cur.execute("INSERT INTO users (nickname) VALUES (?)", (nick,))
+    user_id = cur.lastrowid
+    conn.commit()
     conn.close()
-    if row and bcrypt.verify(password, row[1]):
-        return row[0]
-    return None
+    return user_id
 
 
-def log_mood(user_id: int, mood: str) -> bool:
-    """Log a mood entry for the user."""
+def log_mood(user_id: int, mood: str, intensity: int = 3) -> bool:
+    """Log a mood entry for the user with intensity 1-5."""
+    intensity = max(1, min(5, intensity))
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("INSERT INTO mood_logs (user_id, mood) VALUES (?, ?)", (user_id, mood))
+    cur.execute(
+        "INSERT INTO mood_logs (user_id, mood, intensity) VALUES (?, ?, ?)",
+        (user_id, mood, intensity),
+    )
     conn.commit()
     conn.close()
     return True
@@ -195,83 +188,62 @@ def get_mood_distribution(user_id: int, days: int = 7) -> List[tuple]:
     return rows
 
 
-# -------------------------------------------------------------------
-# Page config and session state
-# -------------------------------------------------------------------
 st.set_page_config(page_title="Mood Tracker", page_icon="😊", layout="wide")
 
 init_db()
 
 if "user_id" not in st.session_state:
     st.session_state.user_id = None
-if "username" not in st.session_state:
-    st.session_state.username = None
+if "nickname" not in st.session_state:
+    st.session_state.nickname = None
 
-# -------------------------------------------------------------------
-# Login / Signup (if not authenticated)
-# -------------------------------------------------------------------
+
 if st.session_state.user_id is None:
     st.markdown(
         """
         <div style="text-align: center; padding: 2rem 0 1rem;">
             <h1 style="margin-bottom: 0.5rem;">😊 Mood Tracker</h1>
-            <p style="color: #94a3b8; font-size: 1.1rem;">Log in or sign up to track your mood with facial recognition.</p>
+            <p style="color: #94a3b8; font-size: 1.1rem;">Enter your nickname to track your mood with facial recognition.</p>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    if not PASSLIB_AVAILABLE:
-        st.error("Please install passlib: `pip install 'passlib[bcrypt]'`")
-        st.stop()
-
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
-        with st.container():
-            tab1, tab2 = st.tabs(["Login", "Sign Up"])
-            st.divider()
-
-            with tab1:
-                with st.form("login_form"):
-                    st.markdown("#### Welcome back")
-                    login_user = st.text_input("Username", key="login_user")
-                    login_pass = st.password_input("Password", key="login_pass")
-                    if st.form_submit_button("Login"):
-                        uid = verify_user(login_user, login_pass)
-                        if uid:
-                            st.session_state.user_id = uid
-                            st.session_state.username = login_user
-                            st.toast("Logged in successfully!", icon="✅")
-                            st.rerun()
-                        else:
-                            st.error("Invalid username or password.")
-
-            with tab2:
-                with st.form("signup_form"):
-                    st.markdown("#### Create an account")
-                    signup_user = st.text_input("Username", key="signup_user")
-                    signup_email = st.text_input("Email", key="signup_email")
-                    signup_pass = st.password_input("Password", key="signup_pass")
-                    if st.form_submit_button("Sign Up"):
-                        uid = create_user(signup_user, signup_email, signup_pass)
-                        if uid:
-                            st.session_state.user_id = uid
-                            st.session_state.username = signup_user
-                            st.toast("Account created! You are now logged in.", icon="✅")
-                            st.rerun()
-                        else:
-                            st.error("Username or email already exists. Try a different one.")
+        with st.form("nickname_form"):
+            nickname = st.text_input("Your nickname", placeholder="e.g. Alex, Sam...", key="nickname_input")
+            submitted = st.form_submit_button("Continue")
+            if submitted and nickname.strip():
+                uid = get_or_create_user_by_nickname(nickname)
+                if uid:
+                    st.session_state.user_id = uid
+                    st.session_state.nickname = nickname.strip()
+                    st.toast(f"Hello, {nickname.strip()}!", icon="👋")
+                    st.rerun()
+                else:
+                    st.error("Please enter a nickname.")
+            elif submitted and not nickname.strip():
+                st.error("Please enter a nickname.")
 
     st.stop()
 
 # -------------------------------------------------------------------
 # Main app (authenticated)
 # -------------------------------------------------------------------
-st.title("😊 Mood Tracker")
+hour = datetime.now().hour
+if 5 <= hour < 12:
+    time_greeting = "Good morning"
+elif 12 <= hour < 17:
+    time_greeting = "Good afternoon"
+else:
+    time_greeting = "Good evening"
+nickname = st.session_state.get("nickname", "there")
+st.title(f"Hello, {time_greeting}, {nickname}!")
 
 # Sidebar
 with st.sidebar:
-    st.write(f"Hello, **{st.session_state.username}**!")
+    st.markdown("## FacesToFeelings")
     with st.expander("About"):
         st.caption(
             "Mood Tracker uses facial recognition to detect Happy, Sad, Angry, or Neutral. "
@@ -399,6 +371,41 @@ mesh = get_mesh(refine, det_conf, track_conf)
 # -------------------------------------------------------------------
 tab_mood, tab_profile, tab_activities = st.tabs(["Mood Tracker", "Profile", "Mood Activities"])
 
+MOOD_ACTIVITIES = {
+    "Happy": [
+        ("Share it", "Tell someone about your good mood"),
+        ("Journal", "Write down what made you happy"),
+        ("Take a photo", "Capture the moment"),
+        ("Go for a walk", "Enjoy the outdoors"),
+    ],
+    "Sad": [
+        ("Listen to uplifting music", "Let music lift your spirits"),
+        ("Talk to a friend", "Reach out for support"),
+        ("Light exercise", "A short walk or stretch"),
+        ("Self-care", "Take a relaxing bath or rest"),
+    ],
+    "Angry": [
+        ("Deep breathing", "4-7-8 breath: inhale 4, hold 7, exhale 8"),
+        ("Short walk", "Step away and cool down"),
+        ("Journal", "Write down what you feel"),
+        ("Cool-down exercise", "Stretching or gentle movement"),
+    ],
+    "Neutral": [
+        ("Try something new", "Learn a new skill or hobby"),
+        ("Short puzzle", "Crossword, Sudoku, or a game"),
+        ("Listen to a podcast", "Explore an interesting topic"),
+        ("Stretch", "A few minutes of gentle stretching"),
+    ],
+}
+INTENSITY_LABELS = {1: "1 – Very slight", 2: "2 – Slight", 3: "3 – Moderate", 4: "4 – Strong", 5: "5 – Very strong"}
+
+ACTIVITY_ICONS = {
+    "Share it": "💬", "Journal": "📝", "Take a photo": "📷", "Go for a walk": "🚶",
+    "Listen to uplifting music": "🎵", "Talk to a friend": "👋", "Light exercise": "🏃", "Self-care": "🧖",
+    "Deep breathing": "🌬️", "Short walk": "🚶", "Cool-down exercise": "🧘",
+    "Try something new": "✨", "Short puzzle": "🧩", "Listen to a podcast": "🎧", "Stretch": "🙆",
+}
+
 # -------------------------------------------------------------------
 # Mood Tracker tab
 # -------------------------------------------------------------------
@@ -412,22 +419,13 @@ with tab_mood:
             - **Live mode (WebRTC):** Start the camera to see real-time mood detection from your facial expressions.
             - **Snapshot mode:** Take a photo with your camera for one-time mood detection.
             - The app analyzes your face (smile, mouth shape, eyebrows) to detect Happy, Sad, Angry, or Neutral.
-            - Click **Log this mood** to save your mood to your profile.
+            - Rate your mood intensity (1–5), then click **Log mood** to save to your profile.
             """
         )
 
-    current_mood = st.session_state.get("last_detected_mood", None)
-
-    if current_mood:
-        mood_emoji = {"Happy": "😊", "Sad": "😢", "Angry": "😠", "Neutral": "😐"}
-        em = mood_emoji.get(current_mood, "😐")
-        st.markdown(f"## {em} {current_mood}")
-        st.caption("Last detected mood — click below to log it to your profile")
-        if st.button("Log this mood"):
-            log_mood(st.session_state.user_id, current_mood)
-            st.toast("Mood logged!", icon="✅")
-            st.rerun()
-
+    # -------------------------------------------------------------------
+    # Face scanning at the top
+    # -------------------------------------------------------------------
     @dataclass
     class _StreamState:
         label: str = "No face"
@@ -562,15 +560,61 @@ with tab_mood:
                         connection_drawing_spec=mp_styles.get_default_face_mesh_contours_style(),
                     )
                 st.image(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), caption=f"Detected: {label}")
-                if st.button("Log this mood", key="log_snapshot"):
-                    log_mood(st.session_state.user_id, label)
-                    st.toast("Mood logged!", icon="✅")
-                    st.rerun()
+                st.caption("Scroll down to rate intensity and log your mood.")
             else:
                 st.warning("No face detected in the snapshot.")
 
     if not WEBRTC_AVAILABLE:
         st.warning("Install streamlit-webrtc and av for live video. Snapshot mode is available.")
+
+    # -------------------------------------------------------------------
+    # Mood result, intensity, and activities (below face scanning)
+    # -------------------------------------------------------------------
+    st.markdown("---")
+    current_mood = st.session_state.get("last_detected_mood", None)
+
+    if current_mood:
+        mood_emoji = {"Happy": "😊", "Sad": "😢", "Angry": "😠", "Neutral": "😐"}
+        em = mood_emoji.get(current_mood, "😐")
+        st.markdown(f"## {em} {current_mood}")
+        st.caption("How strongly do you feel this mood? Rate 1–5, then log.")
+        intensity = st.select_slider(
+            "Mood intensity",
+            options=[1, 2, 3, 4, 5],
+            value=3,
+            format_func=lambda x: INTENSITY_LABELS[x],
+            key="mood_intensity",
+            label_visibility="collapsed",
+        )
+        if st.button("Log mood"):
+            log_mood(st.session_state.user_id, current_mood, intensity)
+            st.toast("Mood logged!", icon="✅")
+            st.rerun()
+
+        st.markdown("---")
+        st.markdown("#### Suggested activities for your mood")
+        activities = MOOD_ACTIVITIES.get(current_mood, MOOD_ACTIVITIES["Neutral"])
+        st.markdown(
+            """
+            <style>
+            .activity-card { padding: 1rem; border-radius: 0.5rem; border: 1px solid rgba(124, 58, 237, 0.3);
+                background: rgba(30, 30, 46, 0.6); margin-bottom: 0.75rem; }
+            .activity-card h4 { margin: 0 0 0.25rem 0; }
+            .activity-card p { margin: 0; color: #94a3b8; font-size: 0.9rem; }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+        for i in range(0, len(activities), 2):
+            row = activities[i : i + 2]
+            cols = st.columns(2)
+            for j, (title, desc) in enumerate(row):
+                icon = ACTIVITY_ICONS.get(title, "•")
+                with cols[j]:
+                    st.markdown(
+                        f'<div class="activity-card"><h4>{icon} {title}</h4><p>{desc}</p></div>',
+                        unsafe_allow_html=True,
+                    )
 
 # -------------------------------------------------------------------
 # Profile tab
@@ -677,56 +721,11 @@ with tab_profile:
                 st.caption(f"No mood distribution data yet.")
 
 # -------------------------------------------------------------------
-# Mood Activities tab
+# Mood Activities tab (browse all moods)
 # -------------------------------------------------------------------
-MOOD_ACTIVITIES = {
-    "Happy": [
-        ("Share it", "Tell someone about your good mood"),
-        ("Journal", "Write down what made you happy"),
-        ("Take a photo", "Capture the moment"),
-        ("Go for a walk", "Enjoy the outdoors"),
-    ],
-    "Sad": [
-        ("Listen to uplifting music", "Let music lift your spirits"),
-        ("Talk to a friend", "Reach out for support"),
-        ("Light exercise", "A short walk or stretch"),
-        ("Self-care", "Take a relaxing bath or rest"),
-    ],
-    "Angry": [
-        ("Deep breathing", "4-7-8 breath: inhale 4, hold 7, exhale 8"),
-        ("Short walk", "Step away and cool down"),
-        ("Journal", "Write down what you feel"),
-        ("Cool-down exercise", "Stretching or gentle movement"),
-    ],
-    "Neutral": [
-        ("Try something new", "Learn a new skill or hobby"),
-        ("Short puzzle", "Crossword, Sudoku, or a game"),
-        ("Listen to a podcast", "Explore an interesting topic"),
-        ("Stretch", "A few minutes of gentle stretching"),
-    ],
-}
-
-ACTIVITY_ICONS = {
-    "Share it": "💬",
-    "Journal": "📝",
-    "Take a photo": "📷",
-    "Go for a walk": "🚶",
-    "Listen to uplifting music": "🎵",
-    "Talk to a friend": "👋",
-    "Light exercise": "🏃",
-    "Self-care": "🧖",
-    "Deep breathing": "🌬️",
-    "Short walk": "🚶",
-    "Cool-down exercise": "🧘",
-    "Try something new": "✨",
-    "Short puzzle": "🧩",
-    "Listen to a podcast": "🎧",
-    "Stretch": "🙆",
-}
-
 with tab_activities:
     st.subheader("Mood-based activities")
-    st.write("Choose activities based on how you're feeling.")
+    st.write("Browse activities by mood, or use the Mood Tracker to see suggestions based on your face detection.")
 
     selected_mood = st.selectbox(
         "How are you feeling?",

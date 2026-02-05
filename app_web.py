@@ -1,22 +1,16 @@
+import calendar
 import math
 import os
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 
 import cv2
 import numpy as np
 import streamlit as st
+import streamlit.components.v1 as components
 import mediapipe as mp
-
-WEBRTC_AVAILABLE = False
-try:
-    import av
-    from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
-    WEBRTC_AVAILABLE = True
-except Exception:
-    WEBRTC_AVAILABLE = False
 
 try:
     import plotly.express as px
@@ -188,7 +182,42 @@ def get_mood_distribution(user_id: int, days: int = 7) -> List[tuple]:
     return rows
 
 
-st.set_page_config(page_title="Mood Tracker", page_icon="😊", layout="wide")
+def get_moods_by_date(user_id: int, date_str: str) -> List[tuple]:
+    """Get all mood entries for a specific date."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT mood, intensity, strftime('%H:%M', created_at) as time
+        FROM mood_logs
+        WHERE user_id = ? AND date(created_at) = ?
+        ORDER BY created_at DESC
+    """, (user_id, date_str))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def get_dates_with_moods(user_id: int, year: int, month: int) -> List[str]:
+    """Get list of dates that have mood entries for a specific month."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT DISTINCT date(created_at) as date
+        FROM mood_logs
+        WHERE user_id = ? 
+          AND strftime('%Y', created_at) = ?
+          AND strftime('%m', created_at) = ?
+    """, (user_id, str(year), f"{month:02d}"))
+    rows = cur.fetchall()
+    conn.close()
+    return [row[0] for row in rows]
+
+
+st.set_page_config(
+    page_title="FACES TO FEELINGS", 
+    layout="wide",
+    initial_sidebar_state="collapsed"
+)
 
 init_db()
 
@@ -196,14 +225,221 @@ if "user_id" not in st.session_state:
     st.session_state.user_id = None
 if "nickname" not in st.session_state:
     st.session_state.nickname = None
+if "selected_calendar_date" not in st.session_state:
+    st.session_state.selected_calendar_date = None
+if "calendar_year" not in st.session_state:
+    st.session_state.calendar_year = datetime.now().year
+if "calendar_month" not in st.session_state:
+    st.session_state.calendar_month = datetime.now().month
 
 
 if st.session_state.user_id is None:
+    # Floating motivational quotes with colorful text on white background
+    quotes_html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <style>
+            * { margin: 0; padding: 0; box-sizing: border-box; }
+            body {
+                position: fixed;
+                top: 0;
+                left: 0;
+                width: 100vw;
+                height: 100vh;
+                background: transparent;
+                overflow: hidden;
+                pointer-events: none;
+                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            }
+            
+            .quote {
+                position: absolute;
+                bottom: -50px;
+                font-size: 1.1rem;
+                font-style: italic;
+                font-weight: 500;
+                white-space: nowrap;
+                animation: riseUp 14s linear forwards;
+                text-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+            }
+            
+            @keyframes riseUp {
+                0% {
+                    bottom: -50px;
+                    opacity: 0;
+                }
+                10% {
+                    opacity: 0.7;
+                }
+                60% {
+                    opacity: 0.7;
+                }
+                100% {
+                    bottom: 65%;
+                    opacity: 0;
+                }
+            }
+        </style>
+    </head>
+    <body>
+        <div id="quotes-container"></div>
+        
+        <script>
+            const quotes = [
+                "Believe in yourself",
+                "Every day is a fresh start",
+                "Your feelings are valid",
+                "Progress, not perfection",
+                "You are stronger than you think",
+                "One step at a time",
+                "Be kind to yourself",
+                "Today is full of possibilities",
+                "You matter",
+                "Breathe and let go",
+                "Small steps lead to big changes",
+                "You are enough",
+                "This too shall pass",
+                "Choose joy today",
+                "Your story isn't over yet",
+                "Embrace the journey",
+                "You deserve happiness",
+                "Keep going, you're doing great"
+            ];
+            
+            // Colorful palette
+            const colors = [
+                '#7c3aed', // purple
+                '#3b82f6', // blue
+                '#10b981', // emerald
+                '#f59e0b', // amber
+                '#ec4899', // pink
+                '#6366f1', // indigo
+                '#14b8a6', // teal
+                '#f97316', // orange
+                '#8b5cf6', // violet
+                '#06b6d4'  // cyan
+            ];
+            
+            const container = document.getElementById('quotes-container');
+            let quoteIndex = 0;
+            let colorIndex = 0;
+            
+            function createQuote() {
+                const quote = document.createElement('div');
+                quote.className = 'quote';
+                quote.textContent = '"' + quotes[quoteIndex] + '"';
+                quote.style.left = (Math.random() * 65 + 5) + '%';
+                quote.style.fontSize = (1.0 + Math.random() * 0.3) + 'rem';
+                quote.style.color = colors[colorIndex];
+                
+                container.appendChild(quote);
+                
+                // Remove quote after animation
+                setTimeout(() => {
+                    quote.remove();
+                }, 14000);
+                
+                quoteIndex = (quoteIndex + 1) % quotes.length;
+                colorIndex = (colorIndex + 1) % colors.length;
+            }
+            
+            // Create initial quotes with stagger
+            for (let i = 0; i < 6; i++) {
+                setTimeout(() => createQuote(), i * 1500);
+            }
+            
+            // Continue creating quotes at slow interval
+            setInterval(createQuote, 3000);
+        </script>
+    </body>
+    </html>
+    """
+    
+    # Render the floating quotes as a fixed iframe
+    components.html(quotes_html, height=0, scrolling=False)
+    
+    # White background styling for nickname page
     st.markdown(
         """
-        <div style="text-align: center; padding: 2rem 0 1rem;">
-            <h1 style="margin-bottom: 0.5rem;">😊 Mood Tracker</h1>
-            <p style="color: #94a3b8; font-size: 1.1rem;">Enter your nickname to track your mood with facial recognition.</p>
+        <style>
+        /* White background */
+        [data-testid="stAppViewContainer"] {
+            background-color: #ffffff;
+            overflow: hidden;
+        }
+        .stApp {
+            background-color: #ffffff;
+        }
+        
+        /* Position iframe as background */
+        iframe {
+            position: fixed !important;
+            top: 0 !important;
+            left: 0 !important;
+            width: 100vw !important;
+            height: 100vh !important;
+            border: none !important;
+            z-index: 0 !important;
+            pointer-events: none !important;
+        }
+        
+        /* Keep content above quotes */
+        .stApp > header, .main, .block-container {
+            position: relative;
+            z-index: 1;
+        }
+        
+        /* Fade-in animation */
+        @keyframes fadeInUp {
+            from { opacity: 0; transform: translateY(20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        .main .block-container { animation: fadeInUp 0.6s ease-out; }
+        
+        /* Input styling for white background */
+        .stTextInput input {
+            background-color: #f8fafc;
+            border: 2px solid #e2e8f0;
+            color: #1e293b;
+        }
+        .stTextInput input:focus {
+            box-shadow: 0 0 15px rgba(124, 58, 237, 0.3);
+            border-color: #7c3aed;
+        }
+        .stTextInput label {
+            color: #475569 !important;
+        }
+        
+        /* Button styling - purple gradient */
+        .stButton > button {
+            transition: all 0.3s ease;
+            background: linear-gradient(135deg, #7c3aed 0%, #6366f1 100%);
+            color: #ffffff;
+            border: none;
+        }
+        .stButton > button:hover {
+            transform: scale(1.03);
+            box-shadow: 0 6px 20px rgba(124, 58, 237, 0.4);
+        }
+        
+        /* Form styling */
+        [data-testid="stForm"] {
+            background-color: rgba(255, 255, 255, 0.9);
+            padding: 2rem;
+            border-radius: 16px;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.08);
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    
+    st.markdown(
+        """
+        <div style="text-align: center; padding: 2rem 0 1rem; position: relative; z-index: 1;">
+            <h1 style="margin-bottom: 0.5rem; color: #1e293b; font-weight: 700;">FACES TO FEELINGS</h1>
+            <p style="color: #64748b; font-size: 1.1rem;">Let your emotions fill the pages today, and discover what's waiting for you..</p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -212,7 +448,7 @@ if st.session_state.user_id is None:
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
         with st.form("nickname_form"):
-            nickname = st.text_input("Your nickname", placeholder="e.g. Alex, Sam...", key="nickname_input")
+            nickname = st.text_input("Hi there! Ready to check in?", placeholder="What should we call you?", key="nickname_input")
             submitted = st.form_submit_button("Continue")
             if submitted and nickname.strip():
                 uid = get_or_create_user_by_nickname(nickname)
@@ -231,6 +467,140 @@ if st.session_state.user_id is None:
 # -------------------------------------------------------------------
 # Main app (authenticated)
 # -------------------------------------------------------------------
+
+# Global interactive CSS for main app with light gradient background
+st.markdown(
+    """
+    <style>
+    /* Light gradient background */
+    [data-testid="stAppViewContainer"] {
+        background: linear-gradient(135deg, #f8fafc 0%, #e2e8f0 50%, #cbd5e1 100%);
+        background-attachment: fixed;
+    }
+    .stApp {
+        background: linear-gradient(135deg, #f8fafc 0%, #e2e8f0 50%, #cbd5e1 100%);
+        background-attachment: fixed;
+    }
+    
+    /* Dark text colors for light background */
+    .stApp h1, .stApp h2, .stApp h3 {
+        color: #1e293b;
+    }
+    .stApp p, .stApp span, .stApp label {
+        color: #475569;
+    }
+    
+    /* Fade-in animation */
+    @keyframes fadeIn {
+        from { opacity: 0; transform: translateY(10px); }
+        to { opacity: 1; transform: translateY(0); }
+    }
+    
+    /* Apply fade-in to main content */
+    .main .block-container { animation: fadeIn 0.5s ease-out; }
+    
+    /* Button styling for light theme */
+    .stButton > button {
+        transition: all 0.3s ease;
+        background: linear-gradient(135deg, #7c3aed 0%, #6366f1 100%);
+        color: white;
+        border: none;
+    }
+    .stButton > button:hover {
+        transform: scale(1.02);
+        box-shadow: 0 4px 20px rgba(124, 58, 237, 0.5);
+    }
+    .stButton > button:active {
+        box-shadow: 0 0 25px rgba(124, 58, 237, 0.7);
+    }
+    
+    /* Card hover effect */
+    .activity-card {
+        transition: all 0.3s ease;
+        background: rgba(255, 255, 255, 0.8);
+        border: 1px solid rgba(124, 58, 237, 0.2);
+    }
+    .activity-card:hover {
+        transform: translateY(-4px);
+        box-shadow: 0 8px 25px rgba(124, 58, 237, 0.2);
+        border-color: rgba(124, 58, 237, 0.5);
+    }
+    
+    /* Input styling for light theme */
+    .stTextInput input {
+        background-color: #ffffff;
+        border: 2px solid #e2e8f0;
+        color: #1e293b;
+    }
+    .stTextInput input:focus {
+        box-shadow: 0 0 10px rgba(124, 58, 237, 0.3);
+        border-color: #7C3AED;
+    }
+    
+    /* Slider styling */
+    .stSlider [data-baseweb="slider"] div {
+        transition: all 0.2s ease;
+    }
+    
+    /* Tab styling for light theme */
+    .stTabs [data-baseweb="tab"] {
+        color: #475569;
+    }
+    .stTabs [data-baseweb="tab"]:hover {
+        color: #7C3AED;
+    }
+    .stTabs [data-baseweb="tab"][aria-selected="true"] {
+        color: #7C3AED;
+    }
+    
+    /* Sidebar styling - keep dark for contrast */
+    .stSidebar {
+        background-color: rgba(15, 23, 42, 0.95);
+    }
+    .stSidebar .stButton > button:hover {
+        background: linear-gradient(135deg, #667eea 0%, #7C3AED 100%);
+    }
+    .stSidebar h1, .stSidebar h2, .stSidebar h3, .stSidebar p, .stSidebar span, .stSidebar label {
+        color: #ffffff !important;
+    }
+    
+    /* Metric cards for light theme */
+    [data-testid="stMetric"] {
+        transition: all 0.3s ease;
+        border-radius: 12px;
+        padding: 12px;
+        background: rgba(255, 255, 255, 0.7);
+        border: 1px solid rgba(124, 58, 237, 0.15);
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.05);
+    }
+    [data-testid="stMetric"]:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 6px 20px rgba(124, 58, 237, 0.15);
+    }
+    [data-testid="stMetric"] label {
+        color: #64748b !important;
+    }
+    [data-testid="stMetric"] [data-testid="stMetricValue"] {
+        color: #1e293b !important;
+    }
+    
+    /* Form and container styling */
+    [data-testid="stForm"] {
+        background: rgba(255, 255, 255, 0.8);
+        padding: 1.5rem;
+        border-radius: 12px;
+        border: 1px solid rgba(124, 58, 237, 0.1);
+    }
+    
+    /* Expander styling */
+    .streamlit-expanderHeader {
+        color: #1e293b;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 hour = datetime.now().hour
 if 5 <= hour < 12:
     time_greeting = "Good morning"
@@ -260,16 +630,8 @@ with st.sidebar:
     track_conf = st.slider("Min tracking confidence", 0.0, 1.0, 0.5, 0.05)
     draw_mesh = st.toggle("Draw face mesh overlay", value=False)
 
-    if WEBRTC_AVAILABLE:
-        st.subheader("Camera Constraints (WebRTC)")
-        facing = st.selectbox("Facing mode", ["user (front)", "environment (back)"], index=0)
-        width = st.selectbox("Width", [640, 1280], index=0)
-        height = st.selectbox("Height", [480, 720], index=0)
-        fps = st.selectbox("FPS", [15, 30], index=0)
 
-# -------------------------------------------------------------------
-# MediaPipe FaceMesh setup
-# -------------------------------------------------------------------
+# FaceMesh
 mp_face_mesh = mp.solutions.face_mesh
 mp_drawing = mp.solutions.drawing_utils
 mp_styles = mp.solutions.drawing_styles
@@ -369,7 +731,7 @@ mesh = get_mesh(refine, det_conf, track_conf)
 # -------------------------------------------------------------------
 # Tabs
 # -------------------------------------------------------------------
-tab_mood, tab_profile, tab_activities = st.tabs(["Mood Tracker", "Profile", "Mood Activities"])
+tab_mood, tab_profile, tab_calendar = st.tabs(["Mood Tracker", "Profile", "Mood Calendar"])
 
 MOOD_ACTIVITIES = {
     "Happy": [
@@ -410,8 +772,7 @@ ACTIVITY_ICONS = {
 # Mood Tracker tab
 # -------------------------------------------------------------------
 with tab_mood:
-    st.subheader("Track your mood with facial recognition")
-    st.write("Allow camera access or take a snapshot. Your detected mood will be shown.")
+    st.subheader("Let’s see what’s written in your face.")
 
     with st.expander("How it works"):
         st.markdown(
@@ -424,112 +785,13 @@ with tab_mood:
         )
 
     # -------------------------------------------------------------------
-    # Face scanning at the top
+    # Face scanning - Take a Photo
     # -------------------------------------------------------------------
-    @dataclass
-    class _StreamState:
-        label: str = "No face"
-
-    if WEBRTC_AVAILABLE:
-        _facing = "user" if facing.startswith("user") else "environment"
-
-        class VideoProcessor:
-            def __init__(self):
-                self.state = _StreamState()
-
-            def recv(self, frame):
-                img_bgr = frame.to_ndarray(format="bgr24")
-                img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-                result = mesh.process(img_rgb)
-
-                label = "No face"
-                if result.multi_face_landmarks:
-                    face = result.multi_face_landmarks[0].landmark
-                    label = classify_expression(face)
-
-                    if draw_mesh:
-                        mp_drawing.draw_landmarks(
-                            image=img_bgr,
-                            landmark_list=result.multi_face_landmarks[0],
-                            connections=mp_face_mesh.FACEMESH_TESSELATION,
-                            landmark_drawing_spec=None,
-                            connection_drawing_spec=mp_styles.get_default_face_mesh_tesselation_style(),
-                        )
-                        mp_drawing.draw_landmarks(
-                            image=img_bgr,
-                            landmark_list=result.multi_face_landmarks[0],
-                            connections=mp_face_mesh.FACEMESH_CONTOURS,
-                            landmark_drawing_spec=None,
-                            connection_drawing_spec=mp_styles.get_default_face_mesh_contours_style(),
-                        )
-
-                text = label
-                (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2)
-                cv2.rectangle(img_bgr, (10, 10), (10 + tw + 16, 10 + th + 16), (0, 0, 0), -1)
-                cv2.putText(img_bgr, text, (18, 10 + th + 6), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
-
-                self.state.label = label
-                return av.VideoFrame.from_ndarray(img_bgr, format="bgr24")
-
-        ice_servers: List[Dict[str, Any]] = [
-            {"urls": ["stun:stun.l.google.com:19302"]},
-            {"urls": ["stun:global.stun.twilio.com:3478?transport=udp"]},
-        ]
-        try:
-            turn = st.secrets.get("turn", {})
-            turn_urls = turn.get("urls")
-            turn_username = turn.get("username")
-            turn_credential = turn.get("credential")
-            if turn_urls:
-                turn_entry = {"urls": list(turn_urls) if isinstance(turn_urls, (list, tuple)) else [str(turn_urls)]}
-                if turn_username and turn_credential:
-                    turn_entry["username"] = str(turn_username)
-                    turn_entry["credential"] = str(turn_credential)
-                ice_servers.append(turn_entry)
-        except Exception:
-            pass
-
-        rtc_config = RTCConfiguration({"iceServers": ice_servers})
-        media_stream_constraints = {
-            "video": {
-                "facingMode": _facing,
-                "width": {"ideal": int(width)},
-                "height": {"ideal": int(height)},
-                "frameRate": {"ideal": int(fps)},
-            },
-            "audio": False,
-        }
-
-        ctx = webrtc_streamer(
-            key="expr-detector",
-            mode=WebRtcMode.SENDRECV,
-            rtc_configuration=rtc_config,
-            media_stream_constraints=media_stream_constraints,
-            video_processor_factory=VideoProcessor,
-            async_processing=True,
-        )
-
-        if ctx and ctx.video_processor and ctx.video_processor.state.label not in ("No face", ""):
-            st.session_state.last_detected_mood = ctx.video_processor.state.label
-
-        with st.expander("Connection / Permission Status", expanded=False):
-            if ctx is None:
-                st.write("WebRTC context is not available.")
-            else:
-                st.write(f"WebRTC state: **{getattr(ctx, 'state', None)}**")
-                st.write(f"Playing: **{getattr(ctx, 'playing', None)}**")
-                if ctx.video_processor:
-                    st.write(f"Last label: **{ctx.video_processor.state.label}**")
-                st.info(
-                    "If you don't get a camera prompt: "
-                    "1) Click the lock icon (🔒) → Allow Camera, then reload. "
-                    "2) Close other apps using the camera (Zoom/Teams/Meet). "
-                    "3) Try a different network or mobile hotspot (WebRTC may be blocked)."
-                )
-
-    st.markdown("---")
-    st.subheader("Snapshot mode (no WebRTC)")
-    img_file = st.camera_input("Take a photo")
+    st.subheader("Capture this moment")
+    st.caption("Position yourself in the frame and take your photo when you're ready. Let’s see what your expression has to tell us about you today")
+    
+    img_file = st.camera_input("Capture your face", label_visibility="collapsed")
+    
     if img_file is not None:
         file_bytes = np.frombuffer(img_file.getvalue(), np.uint8)
         bgr = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
@@ -559,13 +821,10 @@ with tab_mood:
                         landmark_drawing_spec=None,
                         connection_drawing_spec=mp_styles.get_default_face_mesh_contours_style(),
                     )
-                st.image(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), caption=f"Detected: {label}")
-                st.caption("Scroll down to rate intensity and log your mood.")
+                st.success(f"Detected mood: {label}")
+                st.caption("Scroll down to share how deeply you’re feeling today. Whenever you're ready, let’s log your mood together.")
             else:
-                st.warning("No face detected in the snapshot.")
-
-    if not WEBRTC_AVAILABLE:
-        st.warning("Install streamlit-webrtc and av for live video. Snapshot mode is available.")
+                st.warning("Oops! We missed you that time. Let’s try again—make sure you’re front and center!")
 
     # -------------------------------------------------------------------
     # Mood result, intensity, and activities (below face scanning)
@@ -577,7 +836,7 @@ with tab_mood:
         mood_emoji = {"Happy": "😊", "Sad": "😢", "Angry": "😠", "Neutral": "😐"}
         em = mood_emoji.get(current_mood, "😐")
         st.markdown(f"## {em} {current_mood}")
-        st.caption("How strongly do you feel this mood? Rate 1–5, then log.")
+        st.caption("How much space is this mood taking up today? Choose from 1–5")
         intensity = st.select_slider(
             "Mood intensity",
             options=[1, 2, 3, 4, 5],
@@ -586,9 +845,9 @@ with tab_mood:
             key="mood_intensity",
             label_visibility="collapsed",
         )
-        if st.button("Log mood"):
+        if st.button("Save mood"):
             log_mood(st.session_state.user_id, current_mood, intensity)
-            st.toast("Mood logged!", icon="✅")
+            st.toast("Received with care", icon="✅")
             st.rerun()
 
         st.markdown("---")
@@ -721,49 +980,171 @@ with tab_profile:
                 st.caption(f"No mood distribution data yet.")
 
 # -------------------------------------------------------------------
-# Mood Activities tab (browse all moods)
+# Mood Calendar tab (view mood entries by date)
 # -------------------------------------------------------------------
-with tab_activities:
-    st.subheader("Mood-based activities")
-    st.write("Browse activities by mood, or use the Mood Tracker to see suggestions based on your face detection.")
-
-    selected_mood = st.selectbox(
-        "How are you feeling?",
-        ["Happy", "Sad", "Angry", "Neutral"],
-        key="activity_mood",
-    )
-
-    activities = MOOD_ACTIVITIES.get(selected_mood, MOOD_ACTIVITIES["Neutral"])
-    mood_emoji = {"Happy": "😊", "Sad": "😢", "Angry": "😠", "Neutral": "😐"}
-    em = mood_emoji.get(selected_mood, "😐")
-
-    st.markdown(f"### {em} Suggestions for when you feel **{selected_mood}**")
-
+with tab_calendar:
+    st.subheader("Mood Calendar")
+    st.write("Click on a date to view your mood entries for that day.")
+    
+    # Calendar styling
     st.markdown(
         """
         <style>
-        .activity-card {
-            padding: 1.25rem;
+        .calendar-header {
+            text-align: center;
+            font-size: 1.3rem;
+            font-weight: 600;
+            margin: 0.5rem 0;
+        }
+        .calendar-day-header {
+            text-align: center;
+            font-weight: 600;
+            color: #94a3b8;
+            padding: 0.5rem 0;
+        }
+        .mood-entry-card {
+            padding: 1rem;
             border-radius: 0.5rem;
             border: 1px solid rgba(124, 58, 237, 0.3);
             background: rgba(30, 30, 46, 0.6);
-            margin-bottom: 1rem;
+            margin-bottom: 0.75rem;
         }
-        .activity-card h4 { margin: 0 0 0.5rem 0; }
-        .activity-card p { margin: 0; color: #94a3b8; font-size: 0.9rem; }
+        .mood-entry-card .time {
+            color: #94a3b8;
+            font-size: 0.85rem;
+        }
+        .mood-entry-card .mood {
+            font-size: 1.1rem;
+            font-weight: 600;
+            margin: 0.25rem 0;
+        }
+        .intensity-bar {
+            height: 8px;
+            border-radius: 4px;
+            background: linear-gradient(90deg, #7c3aed, #a855f7);
+            margin-top: 0.5rem;
+        }
         </style>
         """,
         unsafe_allow_html=True,
     )
-
-    for i in range(0, len(activities), 2):
-        row_activities = activities[i : i + 2]
-        cols = st.columns(2)
-        for j, (title, desc) in enumerate(row_activities):
-            icon = ACTIVITY_ICONS.get(title, "•")
-            with cols[j]:
-                with st.container():
-                    st.markdown(
-                        f'<div class="activity-card"><h4>{icon} {title}</h4><p>{desc}</p></div>',
-                        unsafe_allow_html=True,
-                    )
+    
+    # Navigation for month/year
+    nav_col1, nav_col2, nav_col3 = st.columns([1, 2, 1])
+    
+    with nav_col1:
+        if st.button("◀ Previous", key="prev_month"):
+            if st.session_state.calendar_month == 1:
+                st.session_state.calendar_month = 12
+                st.session_state.calendar_year -= 1
+            else:
+                st.session_state.calendar_month -= 1
+            st.session_state.selected_calendar_date = None
+            st.rerun()
+    
+    with nav_col2:
+        month_name = calendar.month_name[st.session_state.calendar_month]
+        st.markdown(
+            f'<div class="calendar-header">{month_name} {st.session_state.calendar_year}</div>',
+            unsafe_allow_html=True
+        )
+    
+    with nav_col3:
+        if st.button("Next ▶", key="next_month"):
+            if st.session_state.calendar_month == 12:
+                st.session_state.calendar_month = 1
+                st.session_state.calendar_year += 1
+            else:
+                st.session_state.calendar_month += 1
+            st.session_state.selected_calendar_date = None
+            st.rerun()
+    
+    # Get dates with mood entries for this month
+    dates_with_moods = get_dates_with_moods(
+        user_id, 
+        st.session_state.calendar_year, 
+        st.session_state.calendar_month
+    )
+    today = datetime.now().date()
+    
+    # Calendar grid
+    cal = calendar.Calendar(firstweekday=6)  # Start with Sunday
+    month_days = cal.monthdayscalendar(
+        st.session_state.calendar_year, 
+        st.session_state.calendar_month
+    )
+    
+    # Day headers
+    day_headers = st.columns(7)
+    day_names = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+    for i, day_name in enumerate(day_names):
+        with day_headers[i]:
+            st.markdown(f'<div class="calendar-day-header">{day_name}</div>', unsafe_allow_html=True)
+    
+    # Calendar days
+    for week in month_days:
+        week_cols = st.columns(7)
+        for i, day in enumerate(week):
+            with week_cols[i]:
+                if day == 0:
+                    st.write("")  # Empty cell
+                else:
+                    date_str = f"{st.session_state.calendar_year}-{st.session_state.calendar_month:02d}-{day:02d}"
+                    current_date = datetime(
+                        st.session_state.calendar_year, 
+                        st.session_state.calendar_month, 
+                        day
+                    ).date()
+                    
+                    # Determine button style
+                    has_entries = date_str in dates_with_moods
+                    is_today = current_date == today
+                    is_selected = st.session_state.selected_calendar_date == date_str
+                    
+                    # Button label with indicators
+                    label = str(day)
+                    if has_entries:
+                        label = f"🔵 {day}"
+                    if is_today:
+                        label = f"📍 {day}" if not has_entries else f"📍🔵 {day}"
+                    
+                    button_type = "primary" if is_selected else "secondary"
+                    
+                    if st.button(label, key=f"cal_{date_str}", type=button_type, use_container_width=True):
+                        st.session_state.selected_calendar_date = date_str
+                        st.rerun()
+    
+    st.divider()
+    
+    # Display mood entries for selected date
+    if st.session_state.selected_calendar_date:
+        selected_date = datetime.strptime(st.session_state.selected_calendar_date, "%Y-%m-%d")
+        formatted_date = selected_date.strftime("%B %d, %Y")
+        st.markdown(f"### Mood entries for {formatted_date}")
+        
+        entries = get_moods_by_date(user_id, st.session_state.selected_calendar_date)
+        
+        if entries:
+            mood_emoji = {"Happy": "😊", "Sad": "😢", "Angry": "😠", "Neutral": "😐"}
+            intensity_labels = {1: "Very Low", 2: "Low", 3: "Moderate", 4: "High", 5: "Very High"}
+            
+            for mood, intensity, time in entries:
+                emoji = mood_emoji.get(mood, "😐")
+                intensity_pct = (intensity / 5) * 100
+                intensity_label = intensity_labels.get(intensity, "Moderate")
+                
+                st.markdown(
+                    f"""
+                    <div class="mood-entry-card">
+                        <div class="time">🕐 {time}</div>
+                        <div class="mood">{emoji} {mood}</div>
+                        <div>Intensity: {intensity_label} ({intensity}/5)</div>
+                        <div class="intensity-bar" style="width: {intensity_pct}%;"></div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+        else:
+            st.info("No mood entries for this date.")
+    else:
+        st.info("📅 Select a date above to view your mood entries. Days with 🔵 have recorded entries.")

@@ -851,15 +851,35 @@ with tab_mood:
             st.rerun()
 
         st.markdown("---")
-        st.markdown("#### Suggested activities for your mood")
+        st.markdown("#### Handpicked for how you feel")
         activities = MOOD_ACTIVITIES.get(current_mood, MOOD_ACTIVITIES["Neutral"])
+        
+        # Mood-based card colors
+        MOOD_CARD_COLORS = {
+            "Happy": {"bg": "#fef3c7", "border": "#f59e0b", "text": "#92400e", "desc": "#b45309"},
+            "Sad": {"bg": "#dbeafe", "border": "#3b82f6", "text": "#1e40af", "desc": "#1d4ed8"},
+            "Angry": {"bg": "#fee2e2", "border": "#ef4444", "text": "#991b1b", "desc": "#b91c1c"},
+            "Neutral": {"bg": "#f1f5f9", "border": "#64748b", "text": "#334155", "desc": "#475569"},
+        }
+        colors = MOOD_CARD_COLORS.get(current_mood, MOOD_CARD_COLORS["Neutral"])
+        
         st.markdown(
-            """
+            f"""
             <style>
-            .activity-card { padding: 1rem; border-radius: 0.5rem; border: 1px solid rgba(124, 58, 237, 0.3);
-                background: rgba(30, 30, 46, 0.6); margin-bottom: 0.75rem; }
-            .activity-card h4 { margin: 0 0 0.25rem 0; }
-            .activity-card p { margin: 0; color: #94a3b8; font-size: 0.9rem; }
+            .activity-card {{
+                padding: 1rem;
+                border-radius: 0.75rem;
+                border: 2px solid {colors['border']};
+                background: {colors['bg']};
+                margin-bottom: 0.75rem;
+                transition: all 0.3s ease;
+            }}
+            .activity-card:hover {{
+                transform: translateY(-2px);
+                box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
+            }}
+            .activity-card h4 {{ margin: 0 0 0.25rem 0; color: {colors['text']}; }}
+            .activity-card p {{ margin: 0; color: {colors['desc']}; font-size: 0.9rem; }}
             </style>
             """,
             unsafe_allow_html=True,

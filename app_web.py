@@ -55,6 +55,20 @@ def init_db():
             FOREIGN KEY (user_id) REFERENCES users(id)
         )
     """)
+    # Reflections/Journal table
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS reflections (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            mood_log_id INTEGER NOT NULL,
+            mood TEXT NOT NULL,
+            answers TEXT,
+            free_text TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id),
+            FOREIGN KEY (mood_log_id) REFERENCES mood_logs(id)
+        )
+    """)
     # Migration: add intensity column if missing (older DBs)
     cur.execute("PRAGMA table_info(mood_logs)")
     cols = [row[1] for row in cur.fetchall()]
@@ -62,6 +76,13 @@ def init_db():
         cur.execute("ALTER TABLE mood_logs ADD COLUMN intensity INTEGER DEFAULT 3")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_mood_logs_user ON mood_logs(user_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_mood_logs_created ON mood_logs(created_at)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_reflections_user ON reflections(user_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_reflections_mood_log ON reflections(mood_log_id)")
+    # Migration: add improvement_rating column if missing
+    cur.execute("PRAGMA table_info(reflections)")
+    ref_cols = [row[1] for row in cur.fetchall()]
+    if "improvement_rating" not in ref_cols:
+        cur.execute("ALTER TABLE reflections ADD COLUMN improvement_rating INTEGER DEFAULT NULL")
     conn.commit()
     conn.close()
 
@@ -90,8 +111,8 @@ def get_or_create_user_by_nickname(nickname: str) -> Optional[int]:
     return user_id
 
 
-def log_mood(user_id: int, mood: str, intensity: int = 3) -> bool:
-    """Log a mood entry for the user with intensity 1-5."""
+def log_mood(user_id: int, mood: str, intensity: int = 3) -> int:
+    """Log a mood entry for the user with intensity 1-5. Returns mood_log_id."""
     intensity = max(1, min(5, intensity))
     conn = get_conn()
     cur = conn.cursor()
@@ -99,9 +120,10 @@ def log_mood(user_id: int, mood: str, intensity: int = 3) -> bool:
         "INSERT INTO mood_logs (user_id, mood, intensity) VALUES (?, ?, ?)",
         (user_id, mood, intensity),
     )
+    mood_log_id = cur.lastrowid
     conn.commit()
     conn.close()
-    return True
+    return mood_log_id
 
 
 def get_daily_moods(user_id: int) -> List[tuple]:
@@ -213,6 +235,94 @@ def get_dates_with_moods(user_id: int, year: int, month: int) -> List[str]:
     return [row[0] for row in rows]
 
 
+def get_dominant_moods_by_date(user_id: int, year: int, month: int) -> dict:
+    """Get the dominant mood for each date in a month.
+    
+    Returns a dict mapping date string -> dominant mood name.
+    """
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT date(created_at) as date, mood, COUNT(*) as cnt
+        FROM mood_logs
+        WHERE user_id = ? 
+          AND strftime('%Y', created_at) = ?
+          AND strftime('%m', created_at) = ?
+        GROUP BY date(created_at), mood
+        ORDER BY date, cnt DESC
+    """, (user_id, str(year), f"{month:02d}"))
+    rows = cur.fetchall()
+    conn.close()
+    
+    # First occurrence per date has highest count (dominant mood)
+    dominant_moods = {}
+    for date_str, mood, _ in rows:
+        if date_str not in dominant_moods:
+            dominant_moods[date_str] = mood
+    return dominant_moods
+
+
+def save_reflection(user_id: int, mood_log_id: int, mood: str, answers: str, free_text: str) -> int:
+    """Save a journal/reflection entry linked to a mood log. Returns reflection_id."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """INSERT INTO reflections (user_id, mood_log_id, mood, answers, free_text)
+           VALUES (?, ?, ?, ?, ?)""",
+        (user_id, mood_log_id, mood, answers, free_text),
+    )
+    reflection_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return reflection_id
+
+
+def get_reflection_by_mood_log(mood_log_id: int) -> Optional[tuple]:
+    """Retrieve a reflection entry by mood_log_id."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """SELECT id, user_id, mood_log_id, mood, answers, free_text, created_at
+           FROM reflections WHERE mood_log_id = ?""",
+        (mood_log_id,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def update_reflection_rating(reflection_id: int, rating: int) -> bool:
+    """Update the improvement_rating for a reflection."""
+    rating = max(1, min(5, rating))
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE reflections SET improvement_rating = ? WHERE id = ?",
+        (rating, reflection_id),
+    )
+    conn.commit()
+    conn.close()
+    return True
+
+
+def get_user_reflections(user_id: int, limit: int = 50) -> List[tuple]:
+    """Get all reflections for a user with mood log info."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT r.id, r.mood, r.answers, r.free_text, r.improvement_rating,
+               r.created_at, m.intensity
+        FROM reflections r
+        LEFT JOIN mood_logs m ON r.mood_log_id = m.id
+        WHERE r.user_id = ?
+        ORDER BY r.created_at DESC
+        LIMIT ?
+    """, (user_id, limit))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
 st.set_page_config(
     page_title="FACES TO FEELINGS", 
     layout="wide",
@@ -231,6 +341,16 @@ if "calendar_year" not in st.session_state:
     st.session_state.calendar_year = datetime.now().year
 if "calendar_month" not in st.session_state:
     st.session_state.calendar_month = datetime.now().month
+if "show_journal" not in st.session_state:
+    st.session_state.show_journal = False
+if "current_mood_log_id" not in st.session_state:
+    st.session_state.current_mood_log_id = None
+if "journal_mood" not in st.session_state:
+    st.session_state.journal_mood = None
+if "show_rating" not in st.session_state:
+    st.session_state.show_rating = False
+if "pending_reflection_id" not in st.session_state:
+    st.session_state.pending_reflection_id = None
 
 
 if st.session_state.user_id is None:
@@ -255,25 +375,48 @@ if st.session_state.user_id is None:
             
             .quote {
                 position: absolute;
-                bottom: -50px;
-                font-size: 1.1rem;
-                font-style: italic;
+                bottom: -80px;
+                font-size: 1rem;
                 font-weight: 500;
                 white-space: nowrap;
+                padding: 14px 20px;
+                background: white;
+                border-radius: 25px;
+                box-shadow: 0 4px 20px rgba(0, 0, 0, 0.08);
                 animation: riseUp 14s linear forwards;
-                text-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+            }
+            
+            /* Thought cloud bubbles */
+            .quote::before, .quote::after {
+                content: '';
+                position: absolute;
+                background: white;
+                border-radius: 50%;
+                box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
+            }
+            .quote::before {
+                width: 14px;
+                height: 14px;
+                bottom: -8px;
+                left: 22px;
+            }
+            .quote::after {
+                width: 9px;
+                height: 9px;
+                bottom: -16px;
+                left: 18px;
             }
             
             @keyframes riseUp {
                 0% {
-                    bottom: -50px;
+                    bottom: -80px;
                     opacity: 0;
                 }
                 10% {
-                    opacity: 0.7;
+                    opacity: 0.85;
                 }
                 60% {
-                    opacity: 0.7;
+                    opacity: 0.85;
                 }
                 100% {
                     bottom: 65%;
@@ -307,17 +450,17 @@ if st.session_state.user_id is None:
                 "Keep going, you're doing great"
             ];
             
-            // Colorful palette
+            // Colorful palette (no purple/violet)
             const colors = [
-                '#7c3aed', // purple
+                '#1f2937', // dark gray
                 '#3b82f6', // blue
                 '#10b981', // emerald
                 '#f59e0b', // amber
                 '#ec4899', // pink
-                '#6366f1', // indigo
+                '#0ea5e9', // sky blue
                 '#14b8a6', // teal
                 '#f97316', // orange
-                '#8b5cf6', // violet
+                '#64748b', // slate
                 '#06b6d4'  // cyan
             ];
             
@@ -404,23 +547,24 @@ if st.session_state.user_id is None:
             color: #1e293b;
         }
         .stTextInput input:focus {
-            box-shadow: 0 0 15px rgba(124, 58, 237, 0.3);
-            border-color: #7c3aed;
+            box-shadow: 0 0 15px rgba(0, 0, 0, 0.1);
+            border-color: #1f2937;
         }
         .stTextInput label {
-            color: #475569 !important;
+            color: #1f2937 !important;
         }
         
-        /* Button styling - purple gradient */
+        /* Button styling - white with dark border */
         .stButton > button {
             transition: all 0.3s ease;
-            background: linear-gradient(135deg, #7c3aed 0%, #6366f1 100%);
-            color: #ffffff;
-            border: none;
+            background: #ffffff;
+            color: #000000;
+            border: 2px solid #1f2937;
         }
         .stButton > button:hover {
             transform: scale(1.03);
-            box-shadow: 0 6px 20px rgba(124, 58, 237, 0.4);
+            box-shadow: 0 6px 20px rgba(0, 0, 0, 0.15);
+            background: #f8fafc;
         }
         
         /* Form styling */
@@ -502,39 +646,40 @@ st.markdown(
     /* Button styling for light theme */
     .stButton > button {
         transition: all 0.3s ease;
-        background: linear-gradient(135deg, #7c3aed 0%, #6366f1 100%);
-        color: white;
-        border: none;
+        background: #ffffff;
+        color: #000000;
+        border: 2px solid #1f2937;
     }
     .stButton > button:hover {
         transform: scale(1.02);
-        box-shadow: 0 4px 20px rgba(124, 58, 237, 0.5);
+        box-shadow: 0 4px 20px rgba(0, 0, 0, 0.15);
+        background: #f8fafc;
     }
     .stButton > button:active {
-        box-shadow: 0 0 25px rgba(124, 58, 237, 0.7);
+        box-shadow: 0 0 25px rgba(0, 0, 0, 0.2);
     }
     
     /* Card hover effect */
     .activity-card {
         transition: all 0.3s ease;
         background: rgba(255, 255, 255, 0.8);
-        border: 1px solid rgba(124, 58, 237, 0.2);
+        border: 1px solid #e2e8f0;
     }
     .activity-card:hover {
         transform: translateY(-4px);
-        box-shadow: 0 8px 25px rgba(124, 58, 237, 0.2);
-        border-color: rgba(124, 58, 237, 0.5);
+        box-shadow: 0 8px 25px rgba(0, 0, 0, 0.1);
+        border-color: #1f2937;
     }
     
     /* Input styling for light theme */
     .stTextInput input {
         background-color: #ffffff;
         border: 2px solid #e2e8f0;
-        color: #1e293b;
+        color: #000000;
     }
     .stTextInput input:focus {
-        box-shadow: 0 0 10px rgba(124, 58, 237, 0.3);
-        border-color: #7C3AED;
+        box-shadow: 0 0 10px rgba(0, 0, 0, 0.1);
+        border-color: #1f2937;
     }
     
     /* Slider styling */
@@ -547,10 +692,10 @@ st.markdown(
         color: #475569;
     }
     .stTabs [data-baseweb="tab"]:hover {
-        color: #7C3AED;
+        color: #000000;
     }
     .stTabs [data-baseweb="tab"][aria-selected="true"] {
-        color: #7C3AED;
+        color: #000000;
     }
     
     /* Sidebar styling - keep dark for contrast */
@@ -558,7 +703,8 @@ st.markdown(
         background-color: rgba(15, 23, 42, 0.95);
     }
     .stSidebar .stButton > button:hover {
-        background: linear-gradient(135deg, #667eea 0%, #7C3AED 100%);
+        background: #ffffff;
+        color: #000000;
     }
     .stSidebar h1, .stSidebar h2, .stSidebar h3, .stSidebar p, .stSidebar span, .stSidebar label {
         color: #ffffff !important;
@@ -570,12 +716,12 @@ st.markdown(
         border-radius: 12px;
         padding: 12px;
         background: rgba(255, 255, 255, 0.7);
-        border: 1px solid rgba(124, 58, 237, 0.15);
+        border: 1px solid #e2e8f0;
         box-shadow: 0 2px 8px rgba(0, 0, 0, 0.05);
     }
     [data-testid="stMetric"]:hover {
         transform: translateY(-2px);
-        box-shadow: 0 6px 20px rgba(124, 58, 237, 0.15);
+        box-shadow: 0 6px 20px rgba(0, 0, 0, 0.1);
     }
     [data-testid="stMetric"] label {
         color: #64748b !important;
@@ -589,7 +735,7 @@ st.markdown(
         background: rgba(255, 255, 255, 0.8);
         padding: 1.5rem;
         border-radius: 12px;
-        border: 1px solid rgba(124, 58, 237, 0.1);
+        border: 1px solid #e2e8f0;
     }
     
     /* Expander styling */
@@ -710,7 +856,7 @@ def classify_expression(landmarks) -> str:
         return "Happy"
     elif sad_score > 0.12:
         return "Sad"
-    elif angry_score > 0.015:
+    elif angry_score > 0.012:
         return "Angry"
     else:
         return "Neutral"
@@ -731,7 +877,31 @@ mesh = get_mesh(refine, det_conf, track_conf)
 # -------------------------------------------------------------------
 # Tabs
 # -------------------------------------------------------------------
-tab_mood, tab_profile, tab_calendar = st.tabs(["Mood Tracker", "Profile", "Mood Calendar"])
+tab_mood, tab_profile, tab_calendar, tab_journal = st.tabs(["Mood Tracker", "Profile", "Mood Calendar", "My Journal"])
+
+# Journal/Reflection questions by mood
+JOURNAL_QUESTIONS = {
+    "Happy": [
+        "What made you feel happy today?",
+        "Who contributed to this positive feeling?",
+        "How can you carry this feeling into tomorrow?",
+    ],
+    "Sad": [
+        "What's weighing on your mind right now?",
+        "Is there something specific that triggered this feeling?",
+        "What's one small thing that might help you feel better?",
+    ],
+    "Angry": [
+        "What triggered your anger?",
+        "What would help you feel calmer right now?",
+        "Is this something within your control to change?",
+    ],
+    "Neutral": [
+        "What's on your mind today?",
+        "Is there something you're looking forward to?",
+        "How would you describe your energy level right now?",
+    ],
+}
 
 MOOD_ACTIVITIES = {
     "Happy": [
@@ -846,54 +1016,189 @@ with tab_mood:
             label_visibility="collapsed",
         )
         if st.button("Save mood"):
-            log_mood(st.session_state.user_id, current_mood, intensity)
-            st.toast("Received with care", icon="✅")
+            mood_log_id = log_mood(st.session_state.user_id, current_mood, intensity)
+            st.session_state.show_journal = True
+            st.session_state.current_mood_log_id = mood_log_id
+            st.session_state.journal_mood = current_mood
+            st.toast("Mood saved! Now let's reflect...", icon="📝")
             st.rerun()
 
         st.markdown("---")
-        st.markdown("#### Handpicked for how you feel")
-        activities = MOOD_ACTIVITIES.get(current_mood, MOOD_ACTIVITIES["Neutral"])
         
-        # Mood-based card colors
-        MOOD_CARD_COLORS = {
-            "Happy": {"bg": "#fef3c7", "border": "#f59e0b", "text": "#92400e", "desc": "#b45309"},
-            "Sad": {"bg": "#dbeafe", "border": "#3b82f6", "text": "#1e40af", "desc": "#1d4ed8"},
-            "Angry": {"bg": "#fee2e2", "border": "#ef4444", "text": "#991b1b", "desc": "#b91c1c"},
-            "Neutral": {"bg": "#f1f5f9", "border": "#64748b", "text": "#334155", "desc": "#475569"},
-        }
-        colors = MOOD_CARD_COLORS.get(current_mood, MOOD_CARD_COLORS["Neutral"])
-        
-        st.markdown(
-            f"""
-            <style>
-            .activity-card {{
-                padding: 1rem;
-                border-radius: 0.75rem;
-                border: 2px solid {colors['border']};
-                background: {colors['bg']};
-                margin-bottom: 0.75rem;
-                transition: all 0.3s ease;
-            }}
-            .activity-card:hover {{
-                transform: translateY(-2px);
-                box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
-            }}
-            .activity-card h4 {{ margin: 0 0 0.25rem 0; color: {colors['text']}; }}
-            .activity-card p {{ margin: 0; color: {colors['desc']}; font-size: 0.9rem; }}
-            </style>
-            """,
-            unsafe_allow_html=True,
-        )
-        for i in range(0, len(activities), 2):
-            row = activities[i : i + 2]
-            cols = st.columns(2)
-            for j, (title, desc) in enumerate(row):
-                icon = ACTIVITY_ICONS.get(title, "•")
-                with cols[j]:
-                    st.markdown(
-                        f'<div class="activity-card"><h4>{icon} {title}</h4><p>{desc}</p></div>',
-                        unsafe_allow_html=True,
+        # Show journal section if triggered, otherwise show activities
+        if st.session_state.show_journal and st.session_state.journal_mood:
+            # Journal/Reflection Section
+            journal_mood = st.session_state.journal_mood
+            mood_emoji = {"Happy": "😊", "Sad": "😢", "Angry": "😠", "Neutral": "😐"}
+            emoji = mood_emoji.get(journal_mood, "😐")
+            
+            st.markdown(f"### 📝 Reflection Journal")
+            st.markdown(f"Take a moment to reflect on feeling **{emoji} {journal_mood}**")
+            
+            # Styling for journal
+            st.markdown(
+                """
+                <style>
+                .journal-container {
+                    background: linear-gradient(135deg, #f8fafc 0%, #f1f5f9 100%);
+                    padding: 1.5rem;
+                    border-radius: 1rem;
+                    border: 1px solid #e2e8f0;
+                    margin-bottom: 1rem;
+                }
+                .journal-question {
+                    color: #1e293b;
+                    font-weight: 500;
+                    margin-bottom: 0.5rem;
+                }
+                </style>
+                """,
+                unsafe_allow_html=True,
+            )
+            
+            # Get questions for this mood
+            questions = JOURNAL_QUESTIONS.get(journal_mood, JOURNAL_QUESTIONS["Neutral"])
+            
+            # Create input fields for each question
+            answers = {}
+            for i, question in enumerate(questions):
+                st.markdown(f"**{i+1}. {question}**")
+                answers[question] = st.text_area(
+                    f"Your answer",
+                    key=f"journal_q_{i}",
+                    height=80,
+                    label_visibility="collapsed",
+                    placeholder="Type your thoughts here..."
+                )
+            
+            # Free text area
+            st.markdown("**Anything else on your mind?** (Optional)")
+            free_text = st.text_area(
+                "Free thoughts",
+                key="journal_free_text",
+                height=100,
+                label_visibility="collapsed",
+                placeholder="Write freely here..."
+            )
+            
+            # Save and Skip buttons
+            col_save, col_skip = st.columns(2)
+            with col_save:
+                if st.button("Save Journal", type="primary", use_container_width=True):
+                    import json
+                    answers_json = json.dumps(answers)
+                    reflection_id = save_reflection(
+                        st.session_state.user_id,
+                        st.session_state.current_mood_log_id,
+                        journal_mood,
+                        answers_json,
+                        free_text
                     )
+                    # Trigger rating flow
+                    st.session_state.show_journal = False
+                    st.session_state.show_rating = True
+                    st.session_state.pending_reflection_id = reflection_id
+                    st.toast("Journal saved! One more step...", icon="📝")
+                    st.rerun()
+            
+            with col_skip:
+                if st.button("Skip for now", use_container_width=True):
+                    # Clear journal state without saving
+                    st.session_state.show_journal = False
+                    st.session_state.current_mood_log_id = None
+                    st.session_state.journal_mood = None
+                    st.toast("No worries, you can reflect anytime!", icon="👍")
+                    st.rerun()
+        
+        elif st.session_state.show_rating and st.session_state.pending_reflection_id:
+            # Rating Section - appears after saving journal
+            st.markdown("### 🌟 How do you feel now?")
+            st.markdown("After reflecting, do you feel any better?")
+            
+            # Rating labels
+            RATING_LABELS = {
+                1: "😔 Much worse",
+                2: "😕 A bit worse",
+                3: "😐 About the same",
+                4: "🙂 A bit better",
+                5: "😊 Much better"
+            }
+            
+            rating = st.select_slider(
+                "Rate your improvement",
+                options=[1, 2, 3, 4, 5],
+                value=3,
+                format_func=lambda x: RATING_LABELS[x],
+                key="improvement_rating_slider",
+            )
+            
+            col_rate, col_skip_rate = st.columns(2)
+            with col_rate:
+                if st.button("Save Rating", type="primary", use_container_width=True):
+                    update_reflection_rating(st.session_state.pending_reflection_id, rating)
+                    # Clear all state
+                    st.session_state.show_rating = False
+                    st.session_state.pending_reflection_id = None
+                    st.session_state.current_mood_log_id = None
+                    st.session_state.journal_mood = None
+                    st.toast("Thank you for sharing! Take care! 💚", icon="✅")
+                    st.rerun()
+            
+            with col_skip_rate:
+                if st.button("Skip rating", use_container_width=True):
+                    # Clear all state without saving rating
+                    st.session_state.show_rating = False
+                    st.session_state.pending_reflection_id = None
+                    st.session_state.current_mood_log_id = None
+                    st.session_state.journal_mood = None
+                    st.toast("That's okay! Your journal is saved.", icon="👍")
+                    st.rerun()
+        
+        else:
+            # Show activities section
+            st.markdown("#### Handpicked for how you feel")
+            activities = MOOD_ACTIVITIES.get(current_mood, MOOD_ACTIVITIES["Neutral"])
+            
+            # Mood-based card colors
+            MOOD_CARD_COLORS = {
+                "Happy": {"bg": "#fef3c7", "border": "#f59e0b", "text": "#92400e", "desc": "#b45309"},
+                "Sad": {"bg": "#dbeafe", "border": "#3b82f6", "text": "#1e40af", "desc": "#1d4ed8"},
+                "Angry": {"bg": "#fee2e2", "border": "#ef4444", "text": "#991b1b", "desc": "#b91c1c"},
+                "Neutral": {"bg": "#f1f5f9", "border": "#64748b", "text": "#334155", "desc": "#475569"},
+            }
+            colors = MOOD_CARD_COLORS.get(current_mood, MOOD_CARD_COLORS["Neutral"])
+            
+            st.markdown(
+                f"""
+                <style>
+                .activity-card {{
+                    padding: 1rem;
+                    border-radius: 0.75rem;
+                    border: 2px solid {colors['border']};
+                    background: {colors['bg']};
+                    margin-bottom: 0.75rem;
+                    transition: all 0.3s ease;
+                }}
+                .activity-card:hover {{
+                    transform: translateY(-2px);
+                    box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
+                }}
+                .activity-card h4 {{ margin: 0 0 0.25rem 0; color: {colors['text']}; }}
+                .activity-card p {{ margin: 0; color: {colors['desc']}; font-size: 0.9rem; }}
+                </style>
+                """,
+                unsafe_allow_html=True,
+            )
+            for i in range(0, len(activities), 2):
+                row = activities[i : i + 2]
+                cols = st.columns(2)
+                for j, (title, desc) in enumerate(row):
+                    icon = ACTIVITY_ICONS.get(title, "•")
+                    with cols[j]:
+                        st.markdown(
+                            f'<div class="activity-card"><h4>{icon} {title}</h4><p>{desc}</p></div>',
+                            unsafe_allow_html=True,
+                        )
 
 # -------------------------------------------------------------------
 # Profile tab
@@ -964,6 +1269,7 @@ with tab_profile:
                         barmode="stack",
                     )
                     _apply_plotly_dark(fig_daily)
+                    fig_daily.update_layout(height=350, margin=dict(t=40, b=40, l=40, r=20))
                     st.plotly_chart(fig_daily, use_container_width=True, config=PLOTLY_DARK_CONFIG)
                 else:
                     st.caption("No data for today yet.")
@@ -981,10 +1287,13 @@ with tab_profile:
                         barmode="stack",
                     )
                     _apply_plotly_dark(fig_weekly)
+                    fig_weekly.update_layout(height=350, margin=dict(t=40, b=40, l=40, r=20))
                     st.plotly_chart(fig_weekly, use_container_width=True, config=PLOTLY_DARK_CONFIG)
                 else:
                     st.caption(f"No data for the last {days_range} days yet.")
 
+            st.divider()
+            
             st.markdown(f"#### Mood distribution (last {days_range} days)")
             if dist:
                 df_dist = [{"Mood": m, "Count": c} for m, c in dist]
@@ -995,6 +1304,7 @@ with tab_profile:
                     title="Overall mood distribution",
                 )
                 _apply_plotly_dark(fig_pie)
+                fig_pie.update_layout(height=400, margin=dict(t=40, b=40, l=40, r=40))
                 st.plotly_chart(fig_pie, use_container_width=True, config=PLOTLY_DARK_CONFIG)
             else:
                 st.caption(f"No mood distribution data yet.")
@@ -1025,23 +1335,24 @@ with tab_calendar:
         .mood-entry-card {
             padding: 1rem;
             border-radius: 0.5rem;
-            border: 1px solid rgba(124, 58, 237, 0.3);
-            background: rgba(30, 30, 46, 0.6);
+            border: 1px solid #e2e8f0;
+            background: #ffffff;
             margin-bottom: 0.75rem;
         }
         .mood-entry-card .time {
-            color: #94a3b8;
+            color: #64748b;
             font-size: 0.85rem;
         }
         .mood-entry-card .mood {
             font-size: 1.1rem;
             font-weight: 600;
             margin: 0.25rem 0;
+            color: #000000;
         }
         .intensity-bar {
             height: 8px;
             border-radius: 4px;
-            background: linear-gradient(90deg, #7c3aed, #a855f7);
+            background: linear-gradient(90deg, #64748b, #1f2937);
             margin-top: 0.5rem;
         }
         </style>
@@ -1079,13 +1390,76 @@ with tab_calendar:
             st.session_state.selected_calendar_date = None
             st.rerun()
     
-    # Get dates with mood entries for this month
-    dates_with_moods = get_dates_with_moods(
+    # Get dominant moods for dates with entries this month
+    dominant_moods = get_dominant_moods_by_date(
         user_id, 
         st.session_state.calendar_year, 
         st.session_state.calendar_month
     )
     today = datetime.now().date()
+    
+    # Mood emoji and color mappings
+    MOOD_EMOJI = {"Happy": "😊", "Sad": "😢", "Angry": "😠", "Neutral": "😐"}
+    MOOD_COLORS = {
+        "Happy": {"bg": "#fbbf24", "border": "#d97706", "text": "#000000"},   # Bright yellow
+        "Sad": {"bg": "#3b82f6", "border": "#1d4ed8", "text": "#ffffff"},     # Bright blue
+        "Angry": {"bg": "#ef4444", "border": "#b91c1c", "text": "#ffffff"},   # Bright red
+        "Neutral": {"bg": "#9ca3af", "border": "#6b7280", "text": "#000000"}, # Medium gray
+    }
+    
+    # Inject JavaScript to color buttons based on emoji content
+    components.html(
+        """
+        <script>
+        function colorMoodButtons() {
+            // Bold mood colors
+            const moodColors = {
+                '😊': {bg: '#fbbf24', border: '#d97706', text: '#000000'},  // Bright yellow
+                '😢': {bg: '#3b82f6', border: '#1d4ed8', text: '#ffffff'},  // Bright blue
+                '😠': {bg: '#ef4444', border: '#b91c1c', text: '#ffffff'},  // Bright red
+                '😐': {bg: '#9ca3af', border: '#6b7280', text: '#000000'}   // Medium gray
+            };
+            
+            // Target ALL buttons (both primary and secondary)
+            const buttons = parent.document.querySelectorAll('button');
+            buttons.forEach(btn => {
+                const text = btn.textContent;
+                for (const [emoji, colors] of Object.entries(moodColors)) {
+                    if (text.includes(emoji)) {
+                        btn.style.backgroundColor = colors.bg + ' !important';
+                        btn.style.setProperty('background-color', colors.bg, 'important');
+                        btn.style.setProperty('border-color', colors.border, 'important');
+                        btn.style.setProperty('color', colors.text, 'important');
+                        btn.style.setProperty('border-width', '2px', 'important');
+                        break;
+                    }
+                }
+            });
+        }
+        
+        // Run multiple times to catch Streamlit rerenders
+        colorMoodButtons();
+        setTimeout(colorMoodButtons, 50);
+        setTimeout(colorMoodButtons, 150);
+        setTimeout(colorMoodButtons, 300);
+        setTimeout(colorMoodButtons, 600);
+        setTimeout(colorMoodButtons, 1000);
+        
+        // Use MutationObserver to reapply when DOM changes
+        const observer = new MutationObserver(() => {
+            colorMoodButtons();
+        });
+        
+        if (parent.document.body) {
+            observer.observe(parent.document.body, {
+                childList: true,
+                subtree: true
+            });
+        }
+        </script>
+        """,
+        height=0,
+    )
     
     # Calendar grid
     cal = calendar.Calendar(firstweekday=6)  # Start with Sunday
@@ -1117,16 +1491,21 @@ with tab_calendar:
                     ).date()
                     
                     # Determine button style
-                    has_entries = date_str in dates_with_moods
+                    dominant_mood = dominant_moods.get(date_str)
                     is_today = current_date == today
                     is_selected = st.session_state.selected_calendar_date == date_str
                     
-                    # Button label with indicators
+                    # Button label with mood emoji indicators
                     label = str(day)
-                    if has_entries:
-                        label = f"🔵 {day}"
+                    if dominant_mood:
+                        mood_emoji = MOOD_EMOJI.get(dominant_mood, "😐")
+                        label = f"{mood_emoji} {day}"
                     if is_today:
-                        label = f"📍 {day}" if not has_entries else f"📍🔵 {day}"
+                        if dominant_mood:
+                            mood_emoji = MOOD_EMOJI.get(dominant_mood, "😐")
+                            label = f"📍{mood_emoji} {day}"
+                        else:
+                            label = f"📍 {day}"
                     
                     button_type = "primary" if is_selected else "secondary"
                     
@@ -1167,4 +1546,199 @@ with tab_calendar:
         else:
             st.info("No mood entries for this date.")
     else:
-        st.info("📅 Select a date above to view your mood entries. Days with 🔵 have recorded entries.")
+        st.info("📅 Select a date to view entries. Button colors: 🟡 Happy, 🔵 Sad, 🔴 Angry, ⚪ Neutral")
+
+# -------------------------------------------------------------------
+# My Journal tab (view reflection history)
+# -------------------------------------------------------------------
+with tab_journal:
+    st.subheader("My Journal")
+    st.write("Your reflection history - a record of your inner journey.")
+    
+    user_id = st.session_state.user_id
+    
+    if st.button("Refresh journal", key="refresh_journal"):
+        st.toast("Journal refreshed!", icon="🔄")
+        st.rerun()
+    
+    # Get all reflections
+    reflections = get_user_reflections(user_id, limit=50)
+    
+    if reflections:
+        # Mood emoji mapping
+        mood_emoji = {"Happy": "😊", "Sad": "😢", "Angry": "😠", "Neutral": "😐"}
+        rating_labels = {
+            1: "😔 Much worse",
+            2: "😕 A bit worse", 
+            3: "😐 About the same",
+            4: "🙂 A bit better",
+            5: "😊 Much better",
+            None: "Not rated"
+        }
+        
+        # Styling for journal cards
+        st.markdown(
+            """
+            <style>
+            .journal-card {
+                background: linear-gradient(135deg, #ffffff 0%, #f8fafc 100%);
+                padding: 1.25rem;
+                border-radius: 1rem;
+                border: 1px solid #e2e8f0;
+                margin-bottom: 1rem;
+                box-shadow: 0 2px 8px rgba(0, 0, 0, 0.04);
+            }
+            .journal-card-header {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                margin-bottom: 0.75rem;
+                padding-bottom: 0.5rem;
+                border-bottom: 1px solid #f1f5f9;
+            }
+            .journal-date {
+                color: #64748b;
+                font-size: 0.85rem;
+            }
+            .journal-mood-badge {
+                display: inline-block;
+                padding: 0.25rem 0.75rem;
+                border-radius: 1rem;
+                font-size: 0.85rem;
+                font-weight: 500;
+            }
+            .mood-Happy { background: #fef3c7; color: #92400e; }
+            .mood-Sad { background: #dbeafe; color: #1e40af; }
+            .mood-Angry { background: #fee2e2; color: #991b1b; }
+            .mood-Neutral { background: #f3f4f6; color: #374151; }
+            .journal-qa {
+                margin: 0.75rem 0;
+                padding: 0.75rem;
+                background: #f8fafc;
+                border-radius: 0.5rem;
+            }
+            .journal-question {
+                color: #475569;
+                font-size: 0.9rem;
+                font-weight: 500;
+                margin-bottom: 0.25rem;
+            }
+            .journal-answer {
+                color: #1e293b;
+                font-size: 0.95rem;
+            }
+            .journal-rating {
+                margin-top: 0.75rem;
+                padding: 0.5rem 0.75rem;
+                background: #f0fdf4;
+                border-radius: 0.5rem;
+                color: #166534;
+                font-size: 0.9rem;
+            }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+        
+        # Group by date
+        from collections import defaultdict
+        import json
+        
+        grouped = defaultdict(list)
+        for r in reflections:
+            ref_id, mood, answers_json, free_text, improvement_rating, created_at, intensity = r
+            date_str = created_at.split(" ")[0] if " " in str(created_at) else str(created_at)[:10]
+            grouped[date_str].append(r)
+        
+        for date_str, entries in grouped.items():
+            # Format date nicely
+            try:
+                date_obj = datetime.strptime(date_str, "%Y-%m-%d")
+                formatted_date = date_obj.strftime("%B %d, %Y")
+            except:
+                formatted_date = date_str
+            
+            with st.expander(f"📅 {formatted_date} ({len(entries)} entr{'y' if len(entries) == 1 else 'ies'})", expanded=False):
+                for ref_id, mood, answers_json, free_text, improvement_rating, created_at, intensity in entries:
+                    emoji = mood_emoji.get(mood, "😐")
+                    
+                    # Parse time
+                    try:
+                        time_str = created_at.split(" ")[1][:5] if " " in str(created_at) else ""
+                    except:
+                        time_str = ""
+                    
+                    # Parse answers
+                    try:
+                        answers = json.loads(answers_json) if answers_json else {}
+                    except:
+                        answers = {}
+                    
+                    st.markdown(
+                        f"""
+                        <div class="journal-card">
+                            <div class="journal-card-header">
+                                <span class="journal-mood-badge mood-{mood}">{emoji} {mood}</span>
+                                <span class="journal-date">🕐 {time_str}</span>
+                            </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+                    
+                    # Display Q&A
+                    for question, answer in answers.items():
+                        if answer and answer.strip():
+                            st.markdown(
+                                f"""
+                                <div class="journal-qa">
+                                    <div class="journal-question">Q: {question}</div>
+                                    <div class="journal-answer">{answer}</div>
+                                </div>
+                                """,
+                                unsafe_allow_html=True,
+                            )
+                    
+                    # Free text
+                    if free_text and free_text.strip():
+                        st.markdown(
+                            f"""
+                            <div class="journal-qa">
+                                <div class="journal-question">Additional thoughts:</div>
+                                <div class="journal-answer">{free_text}</div>
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
+                    
+                    # Rating
+                    rating_text = rating_labels.get(improvement_rating, "Not rated")
+                    if improvement_rating:
+                        st.markdown(
+                            f"""
+                            <div class="journal-rating">
+                                After reflecting: {rating_text}
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
+                    
+                    st.markdown("</div>", unsafe_allow_html=True)
+        
+        # Summary stats
+        st.divider()
+        total_entries = len(reflections)
+        rated_entries = sum(1 for r in reflections if r[4] is not None)
+        avg_rating = sum(r[4] for r in reflections if r[4] is not None) / rated_entries if rated_entries > 0 else 0
+        
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Total Entries", total_entries)
+        with col2:
+            st.metric("Rated Entries", rated_entries)
+        with col3:
+            if avg_rating > 0:
+                st.metric("Avg Improvement", f"{avg_rating:.1f}/5")
+            else:
+                st.metric("Avg Improvement", "—")
+    else:
+        st.info("No journal entries yet. Save a mood and complete the reflection journal to see your entries here!")

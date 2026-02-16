@@ -530,7 +530,13 @@ if st.session_state.user_id is None:
         /* Keep content above quotes */
         .stApp > header, .main, .block-container {
             position: relative;
-            z-index: 1;
+            z-index: 10;
+        }
+        
+        /* Ensure form is above floating quotes */
+        [data-testid="stForm"] {
+            position: relative;
+            z-index: 15 !important;
         }
         
         /* Fade-in animation */
@@ -787,80 +793,109 @@ LM = {
     "mouth_right": 291,
     "upper_inner": 13,
     "lower_inner": 14,
-    "left_eye_outer": 33,
+
     "left_eye_inner": 133,
-    "right_eye_outer": 263,
+    "left_eye_outer": 33,
     "right_eye_inner": 362,
-    "nose_tip": 1,
+    "right_eye_outer": 263,
+
+    # Correct eyebrow points
     "left_brow_inner": 276,
     "left_brow_outer": 282,
     "right_brow_inner": 336,
     "right_brow_outer": 334,
+
     "left_eye_upper": 159,
     "right_eye_upper": 386,
 }
 
-
-def _dist_norm(a, b) -> float:
-    dx, dy = (a.x - b.x), (a.y - b.y)
-    return math.hypot(dx, dy)
-
+def _dist_norm(p1, p2) -> float:
+    dx = (p1.x - p2.x)
+    dy = (p1.y - p2.y)
+    return float(np.sqrt(dx * dx + dy * dy))
 
 def classify_expression(landmarks) -> str:
     """
     Returns: Happy, Sad, Angry, or Neutral
+    landmarks: mediapipe face_landmarks.landmark (list-like of 468 points)
     """
-    L = landmarks[LM["mouth_left"]]
-    R = landmarks[LM["mouth_right"]]
-    U = landmarks[LM["upper_inner"]]
-    D = landmarks[LM["lower_inner"]]
-    LE_in = landmarks[LM["left_eye_inner"]]
-    LE_out = landmarks[LM["left_eye_outer"]]
-    RE_in = landmarks[LM["right_eye_inner"]]
-    RE_out = landmarks[LM["right_eye_outer"]]
+    if landmarks is None:
+        return "Neutral"
 
+    try:
+        # Extraction
+        L = landmarks[LM["mouth_left"]]
+        R = landmarks[LM["mouth_right"]]
+        U = landmarks[LM["upper_inner"]]
+        D = landmarks[LM["lower_inner"]]
+
+        LE_in = landmarks[LM["left_eye_inner"]]
+        LE_out = landmarks[LM["left_eye_outer"]]
+        RE_in = landmarks[LM["right_eye_inner"]]
+        RE_out = landmarks[LM["right_eye_outer"]]
+
+        lb_in = landmarks[LM["left_brow_inner"]]
+        lb_out = landmarks[LM["left_brow_outer"]]
+        rb_in = landmarks[LM["right_brow_inner"]]
+        rb_out = landmarks[LM["right_brow_outer"]]
+
+        le_up = landmarks[LM["left_eye_upper"]]
+        re_up = landmarks[LM["right_eye_upper"]]
+
+    except (KeyError, IndexError, TypeError):
+        # KeyError: missing LM key, IndexError: landmark index out of range
+        return "Neutral"
+
+    # ---------------- Mouth Metrics ----------------
     mouth_width = _dist_norm(L, R) + 1e-6
     mouth_height = _dist_norm(U, D)
     mar = mouth_height / mouth_width
 
+    # MediaPipe Y-axis: 0 = top, 1 = bottom
     mouth_center_y = (U.y + D.y) / 2.0
     corner_height = ((mouth_center_y - L.y) + (mouth_center_y - R.y)) / 2.0
-    corner_norm = corner_height / mouth_width
+    corner_norm = corner_height / mouth_width  # OK to use mouth width here
 
-    left_eye = _dist_norm(LE_in, LE_out)
-    right_eye = _dist_norm(RE_in, RE_out)
-    eye_avg = (left_eye + right_eye) / 2.0
-    eye_squint = max(0.0, 0.14 - eye_avg)
+    # ---------------- Eye Metrics ----------------
+    left_eye_w = _dist_norm(LE_in, LE_out)
+    right_eye_w = _dist_norm(RE_in, RE_out)
+    eye_avg_w = (left_eye_w + right_eye_w) / 2.0
 
+    # squint heuristic (keep your idea, but clamp)
+    eye_squint = max(0.0, 0.14 - eye_avg_w)
+
+    # ---------------- Brow-Eye Gap (Angry) ----------------
+    avg_brow_y = (lb_in.y + lb_out.y + rb_in.y + rb_out.y) / 4.0
+    avg_eye_y = (le_up.y + re_up.y) / 2.0
+
+    # Use eye width as face scale (more stable than mouth width)
+    face_scale = eye_avg_w + 1e-6
+    brow_eye_gap = (avg_eye_y - avg_brow_y) / face_scale  # smaller gap = brows closer to eyes
+
+    # ---------------- Scoring Logic ----------------
     smile_score = (0.65 * corner_norm) + (0.25 * eye_squint) + (0.10 * mar)
     sad_score = (-0.70 * corner_norm) + (0.10 * (0.22 - mar))
 
-    # Angry: furrowed brows (lowered eyebrows relative to eyes)
-    lb_in = landmarks[LM["left_brow_inner"]]
-    lb_out = landmarks[LM["left_brow_outer"]]
-    rb_in = landmarks[LM["right_brow_inner"]]
-    rb_out = landmarks[LM["right_brow_outer"]]
-    le_up = landmarks[LM["left_eye_upper"]]
-    re_up = landmarks[LM["right_eye_upper"]]
-
-    left_brow_y = (lb_in.y + lb_out.y) / 2
-    right_brow_y = (rb_in.y + rb_out.y) / 2
-    left_eye_y = le_up.y
-    right_eye_y = re_up.y
-
-    brow_lowered_left = left_brow_y - left_eye_y
-    brow_lowered_right = right_brow_y - right_eye_y
-    angry_score = (brow_lowered_left + brow_lowered_right) / 2
-
-    if smile_score > 0.045:
+    # ---------------- Threshold Classification ----------------
+    # (Angry check moved up so it doesn't get masked by Sad)
+    if brow_eye_gap < 0.35:
+        return "Angry"
+    elif smile_score > 0.045:
         return "Happy"
     elif sad_score > 0.12:
         return "Sad"
-    elif angry_score > 0.012:
-        return "Angry"
     else:
         return "Neutral"
 
+
+@st.cache_resource(show_spinner=False)
+def get_mesh(refine: bool, det_conf: float, track_conf: float):
+    return mp_face_mesh.FaceMesh(
+        max_num_faces=1,
+        refine_landmarks=refine,
+        min_detection_confidence=det_conf,
+        min_tracking_confidence=track_conf,
+    )
 
 @st.cache_resource(show_spinner=False)
 def get_mesh(refine: bool, det_conf: float, track_conf: float):
